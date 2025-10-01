@@ -1,0 +1,355 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Einstein@Home Pulsars (PMPS + PALFA) — Cleaned</title>
+  <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+  <style>
+    body { margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; }
+    #uiBar {
+      position: absolute; top: 10px; left: 10px; z-index: 10;
+      display: flex; gap: 8px; flex-wrap: wrap; align-items: center;
+      background: rgba(255,255,255,0.85); border-radius: 6px; padding: 6px 10px; box-shadow: 0 1px 4px rgba(0,0,0,0.15);
+    }
+    #pulsarMap { width: 100%; height: 100vh; }
+    .note {
+      position: absolute; bottom: 10px; left: 10px; z-index: 5;
+      max-width: 720px; background: rgba(255,255,255,0.9); padding: 6px 10px;
+      border-radius: 6px; font-size: 12px; line-height: 1.35; box-shadow: 0 1px 3px rgba(0,0,0,0.12);
+    }
+    label { font-size: 13px; }
+  </style>
+</head>
+<body>
+  <div id="uiBar">
+    <label><input type="checkbox" id="toggleParkes" checked /> Parkes (PMPS)</label>
+    <label><input type="checkbox" id="toggleArecibo" checked /> Arecibo (PALFA)</label>
+    <button id="toggleOutliers">Show Outliers</button>
+  </div>
+
+  <div id="pulsarMap"></div>
+  <div class="note">
+    Distances: Parkes values are DM-based using <b>NE2001</b> from Knispel et&nbsp;al.&nbsp;2013 (Table&nbsp;2).
+    Arecibo values are as-provided in your file (model not specified) plus J1950+2414 set to 7.27&nbsp;kpc from the ATNF catalogue.
+    Uncertainties are large (often &gt;20%). Spiral arms &amp; warp are schematic—<i>not to scale</i>.
+  </div>
+
+  <script>
+    // ---------- Constants & helpers ----------
+    const DEG = Math.PI / 180;
+    const R0 = 27000; // ly; Sun–Galactic-Center distance
+    const colors = { "Parkes": "green", "Arecibo": "purple" };
+
+    // Earth-centric vector in Galactic coordinates pointing toward l=180°, b=0° at 27 kly:
+    function galacticToCartesian(l, b, dLy) {
+      const L = l * DEG, B = b * DEG;
+      return [
+        dLy * Math.cos(B) * Math.cos(L),
+        dLy * Math.cos(B) * Math.sin(L),
+        dLy * Math.sin(B)
+      ];
+    };
+    const sunGC = galacticToCartesian(180, 0, R0); // Sun in the GC frame
+
+    // Convert Sun-centric (l,b,d) to GC frame
+    function toGC_fromLB(l, b, dLy) {
+      const v = galacticToCartesian(l, b, dLy);
+      return [ sunGC[0] + v[0], sunGC[1] + v[1], sunGC[2] + v[2] ];
+    };
+
+    // Parse "HH:MM[:SS]" to degrees (RA)
+    function hmsToDeg(hms) {
+      const s = hms.trim();
+      const parts = s.split(':');
+      const h = parseFloat(parts[0] || '0');
+      const m = parseFloat(parts[1] || '0');
+      const sec = parseFloat(parts[2] || '0');
+      return (h + m/60 + sec/3600) * 15.0;
+    };
+
+    // Parse "±DD:MM[:SS]" to degrees (Dec). Accepts Unicode minus.
+    function dmsToDeg(dms) {
+      const s = dms.trim().replace('−', '-').replace('＋','+');
+      const sign = s.startsWith('-') ? -1 : 1;
+      const clean = s.replace(/^[-+]/,'');
+      const parts = clean.split(':');
+      const d = parseFloat(parts[0] || '0');
+      const m = parseFloat(parts[1] || '0');
+      const sec = parseFloat(parts[2] || '0');
+      return sign * (Math.abs(d) + m/60 + sec/3600);
+    };
+
+    // Equatorial (J2000) -> Galactic (l,b), in degrees.
+    // Adopt IAU 1958 definition with J2000 realization (α_G, δ_G, l_Ω)
+    function radecToGal(raDeg, decDeg) {
+      const ra = raDeg * DEG, dec = decDeg * DEG;
+      const raG = 192.85948 * DEG;
+      const decG = 27.12825 * DEG;
+      const lOmega = 32.93192 * DEG;
+
+      const sinb = Math.sin(dec) * Math.sin(decG) + Math.cos(dec) * Math.cos(decG) * Math.cos(ra - raG);
+      const b = Math.asin(sinb);
+
+      const y = Math.sin(ra - raG) * Math.cos(dec);
+      const x = Math.cos(dec) * Math.sin(decG) - Math.sin(dec) * Math.cos(decG) * Math.cos(ra - raG);
+      let l = Math.atan2(y, x) + lOmega;
+      if (l < 0) l += 2*Math.PI;
+      if (l >= 2*Math.PI) l -= 2*Math.PI;
+
+      return { l: l / DEG, b: b / DEG };
+    }
+
+    function kpcToLy(kpc) { return kpc * 3261.56; }
+
+    // ---------- Parkes PMPS (24) from Knispel+ 2013, Table 2 ----------
+    // RA/Dec from the paper; distances are NE2001 kpc (converted to ly). Names match ATNF (signs corrected).
+    const parkesPMPS = [
+      {name:"J0811+3857", ra:"08:11.7",      dec:"+38:57",     dist_kpc:6.2},
+      {name:"J1227−6208", ra:"12:27.6",      dec:"-62:10",     dist_kpc:8.4},
+      {name:"J1305−6639", ra:"13:05.6",      dec:"-66:39",     dist_kpc:7.5},
+      {name:"J1322−6251", ra:"13:22.9",      dec:"-62:51",     dist_kpc:13.2},
+      {name:"J1455−5923", ra:"14:55.1",      dec:"-59:23",     dist_kpc:7.0},
+      {name:"J1601−5023", ra:"16:01.4",      dec:"-50:23",     dist_kpc:3.6},
+      {name:"J1619−4202", ra:"16:19.1",      dec:"-42:02",     dist_kpc:3.7},
+      {name:"J1626−4422", ra:"16:27.0",      dec:"-44:22",     dist_kpc:4.8},
+      {name:"J1637−4613", ra:"16:37.6",      dec:"-46:13",     dist_kpc:7.0},
+      {name:"J1644−4410", ra:"16:44.6",      dec:"-44:10",     dist_kpc:6.2},
+      {name:"J1644−4626", ra:"16:44.1",      dec:"-46:26",     dist_kpc:4.8},
+      {name:"J1652−4845", ra:"16:52.9",      dec:"-48:45",     dist_kpc:3.3},
+      {name:"J1726−3157", ra:"17:26.6",      dec:"-31:57",     dist_kpc:4.1},
+      {name:"J1748−3009", ra:"17:48:23.79",  dec:"-30:09:12.2",dist_kpc:5.0},
+      {name:"J1750−2536", ra:"17:50:33.39",  dec:"-25:36:43",  dist_kpc:3.2},
+      {name:"J1755+3331", ra:"17:55.2",      dec:"+33:31",     dist_kpc:5.7},
+      {name:"J1804+2807", ra:"18:04.8",      dec:"+28:07",     dist_kpc:4.2},
+      {name:"J1811−1049", ra:"18:11:17.07",  dec:"-10:49:03",  dist_kpc:5.5},
+      {name:"J1817−1938", ra:"18:17:06.82",  dec:"-19:38.6",   dist_kpc:8.6},
+      {name:"J1821+0331", ra:"18:21:44.70",  dec:"+03:31:12.7",dist_kpc:4.3},
+      {name:"J1838+0101", ra:"18:38.5",      dec:"+01:01",     dist_kpc:6.9},
+      {name:"J1838−1849", ra:"18:38:33.79",  dec:"-18:49:59",  dist_kpc:4.5},
+      {name:"J1840−0643", ra:"18:40:09.44",  dec:"-06:43:47",  dist_kpc:6.8},
+      {name:"J1858+0736", ra:"18:58:44.3",   dec:"+07:37",     dist_kpc:5.0}
+    ];
+
+    // ---------- Arecibo PALFA (from your file) with name fixes ----------
+    // Keep l,b,d (ly) as-provided; fix typos; drop two unverified; add J1950+2414 via RA/Dec (7.27 kpc).
+    const areciboLB = [
+      {name:"J2007+2722", l:65.67, b:-2.65, dLy:17600},
+      {name:"J1952+2630", l:63.18, b:-0.26, dLy:30000},
+      {name:"J1851+0035", l:35.71, b:-0.53, dLy:11000},
+      {name:"J1851+0242", l:37.86, b:0.07,  dLy:24100},
+      {name:"J1853+0009", l:34.52, b:-1.35, dLy:10300},
+      {name:"J1853+0029", l:36.52, b:-1.01, dLy:17700},
+      {name:"J1855+0306", l:39.70, b:0.70,  dLy:16800}, // 0307 -> 0306
+      {name:"J1857+0259", l:39.99, b:-0.51, dLy:18100},
+      {name:"J1858+0319", l:40.73, b:-0.07, dLy:41400},
+      {name:"J1859+0347", l:41.69, b:-0.80, dLy:14400},
+      {name:"J1900+0438", l:42.85, b:-0.14, dLy:20900}, // 0439 -> 0438
+      {name:"J1901+0511", l:43.78, b:-0.77, dLy:13900}, // 0510 -> 0511
+      {name:"J1903+0654", l:45.83, b:-0.01, dLy:18900},
+      // Removed: J1907+0510, J1907+0900 (verification pending)
+      {name:"J1908+0833", l:47.80, b:-1.51, dLy:22300}  // 0831 -> 0833
+    ];
+
+    // Additional Arecibo source J1950+2414, with RA/Dec and 7.27 kpc distance (ATNF); compute l,b on the fly.
+    const areciboRaDec = [
+      {name:"J1950+2414", ra:"19:50", dec:"+24:14", dist_kpc:7.27}
+    ];
+
+    // ---------- Build traces ----------
+
+    // Parkes: compute (l,b) from RA/Dec, then to GC with Sun offset
+    const parkesXYZ = parkesPMPS.map(p => {
+      const raDeg = hmsToDeg(p.ra);
+      const decDeg = dmsToDeg(p.dec);
+      const gal = radecToGal(raDeg, decDeg);
+      const dLy = kpcToLy(p.dist_kpc);
+      const gc = toGC_fromLB(gal.l, gal.b, dLy);
+      return { ...p, l: gal.l, b: gal.b, dLy, x: gc[0], y: gc[1], z: gc[2] };
+    });
+
+    const parkesTrace = {
+      name: "Parkes (PMPS, NE2001)",
+      x: parkesXYZ.map(p => p.x),
+      y: parkesXYZ.map(p => p.y),
+      z: parkesXYZ.map(p => p.z),
+      mode: 'markers',
+      type: 'scatter3d',
+      marker: { size: 4, color: parkesXYZ.map(_ => colors["Parkes"]), opacity: 0.85 },
+      text: parkesXYZ.map(p => `${p.name} (Parkes) — ~${(p.dist_kpc).toFixed(1)} kpc`),
+      hoverinfo: 'text'
+    };
+
+    // Arecibo: (l,b,dLy) pre-given
+    const areciboXYZ_fromLB = areciboLB.map(p => {
+      const gc = toGC_fromLB(p.l, p.b, p.dLy);
+      return { ...p, x: gc[0], y: gc[1], z: gc[2] };
+    });
+
+    // Arecibo RA/Dec entries (currently just J1950+2414)
+    const areciboXYZ_fromRaDec = areciboRaDec.map(p => {
+      const raDeg = hmsToDeg(p.ra);
+      const decDeg = dmsToDeg(p.dec);
+      const gal = radecToGal(raDeg, decDeg);
+      const dLy = kpcToLy(p.dist_kpc);
+      const gc = toGC_fromLB(gal.l, gal.b, dLy);
+      return { ...p, l: gal.l, b: gal.b, dLy, x: gc[0], y: gc[1], z: gc[2] };
+    });
+
+    const areciboAll = areciboXYZ_fromLB.concat(areciboXYZ_fromRaDec);
+
+    const areciboTrace = {
+      name: "Arecibo (PALFA)",
+      x: areciboAll.map(p => p.x),
+      y: areciboAll.map(p => p.y),
+      z: areciboAll.map(p => p.z),
+      mode: 'markers',
+      type: 'scatter3d',
+      marker: { size: 5, color: areciboAll.map(_ => colors["Arecibo"]), opacity: 0.9 },
+      text: areciboAll.map(p => `${p.name} (Arecibo)`),
+      hoverinfo: 'text'
+    };
+
+    // Outliers: none by default (J1950+2416 removed). Keep the trace + toggle plumbing.
+    const outliers = []; // Intentionally empty after cleanup
+    const outliersTrace = {
+      name: 'Outliers',
+      x: outliers.map(p => p.x),
+      y: outliers.map(p => p.y),
+      z: outliers.map(p => p.z),
+      mode: 'markers+text',
+      type: 'scatter3d',
+      marker: { size: 7, color: 'red', symbol: 'diamond', opacity: 0.95 },
+      text: outliers.map(p => p.name),
+      textposition: 'top center',
+      hoverinfo: 'text',
+      visible: false
+    };
+
+    // Sagittarius A* (GC) and Earth marker (Sun)
+    const sagittariusA = {
+      x: [0], y: [0], z: [0], mode: 'markers+text', type: 'scatter3d',
+      marker: { size: 8, color: 'orange', symbol: 'circle', opacity: 1 },
+      text: ['Sagittarius A* (Galactic Center)'],
+      textposition: 'top center', hoverinfo: 'text', name: 'Galactic Center', visible: true
+    };
+    const earthTrace = {
+      name: 'Sun/Earth',
+      x: [sunGC[0]], y: [sunGC[1]], z: [sunGC[2]],
+      mode: 'markers+text', type: 'scatter3d',
+      marker: { size: 8, color: 'blue', opacity: 1 },
+      text: ['Our Solar System'],
+      textposition: 'bottom center', hoverinfo: 'text'
+    };
+
+    // Schematic warp, spiral arms, perimeter, disk (unchanged)
+    const galacticWarp = { x: [], y: [], z: [], mode: 'lines', type: 'scatter3d', line: { width: 3, color: '#00cccc' }, name: 'Galactic Warp' };
+    for (let l = 0; l <= 360; l += 5) {
+      const d = 42000, radL = l * DEG, warpZ = 1500 * Math.sin(2 * radL);
+      galacticWarp.x.push(d * Math.cos(radL)); galacticWarp.y.push(d * Math.sin(radL)); galacticWarp.z.push(warpZ);
+    }
+    const milkyWayArms = [];
+    const armCount = 4, pointsPerArm = 120, armSpread = 30000, rotations = 2;
+    for (let arm = 0; arm < armCount; arm++) {
+      let coords = { x: [], y: [], z: [], mode: 'lines', type: 'scatter3d', name: `Spiral Arm ${arm+1}`, line: { width: 2, color: '#aaa' } };
+      for (let i = 0; i < pointsPerArm; i++) {
+        const θ = rotations * 2 * Math.PI * (i / pointsPerArm) + (arm * 2 * Math.PI / armCount);
+        const r = 10000 + armSpread * (i / pointsPerArm);
+        coords.x.push(r * Math.cos(θ)); coords.y.push(r * Math.sin(θ)); const warpZ = 1500 * Math.sin(2 * θ) * (r / 42000); coords.z.push(warpZ);
+      }
+      milkyWayArms.push(coords);
+    }
+    const perimeter = { name: 'Galaxy Perimeter', x: [], y: [], z: [], mode: 'lines', type: 'scatter3d', line: { color: '#444', width: 3 } };
+    for (let i = 0; i <= 360; i += 2) {
+      perimeter.x.push((armSpread + 10000) * Math.cos(i * DEG));
+      perimeter.y.push((armSpread + 10000) * Math.sin(i * DEG));
+      perimeter.z.push(0);
+    }
+    const diskSteps = 90, diskRadius = 42000;
+    let diskX = [], diskY = [], diskZ = [], diskI = [], diskJ = [], diskK = [];
+    for (let i = 0; i < diskSteps; i++) {
+      const t = 2 * Math.PI * (i / diskSteps);
+      diskX.push(diskRadius * Math.cos(t)); diskY.push(diskRadius * Math.sin(t)); diskZ.push(0);
+    }
+    diskX.push(0); diskY.push(0); diskZ.push(0);
+    for (let i = 0; i < diskSteps; i++) { diskI.push(i); diskJ.push((i + 1) % diskSteps); diskK.push(diskSteps); }
+    const milkyWayDisk = { name: 'Milky Way Disk', type: 'mesh3d', x: diskX, y: diskY, z: diskZ, i: diskI, j: diskJ, k: diskK, opacity: 0.12, color: 'yellow', showscale: false };
+
+    // Compose plot data
+    const data = [ parkesTrace, areciboTrace, earthTrace, milkyWayDisk, ...milkyWayArms, perimeter, outliersTrace, sagittariusA, galacticWarp ];
+    const outliersTraceIndex = data.indexOf(outliersTrace);
+
+    // Layout
+    const layout = {
+      title: 'Einstein@Home Pulsars (PMPS + PALFA)',
+      scene: { aspectmode: 'data', dragmode: 'zoom' },
+      margin: { l: 0, r: 0, t: 50, b: 0 }
+    };
+    const config = { modeBarButtonsToRemove: ['orbitRotation','turntableRotation','pan3d'] };
+
+    const pulsarMap = document.getElementById('pulsarMap');
+    Plotly.newPlot(pulsarMap, data, layout, config);
+
+    // ---------- Camera controls (same behavior) ----------
+    let isDragging = false, startX = 0, startY = 0;
+    let startTheta = 0, startPhi = 0, totalRadius = 0;
+    let camera = { eye: { x:2, y:2, z:0.5 }, up: { x:0, y:0, z:1 } };
+    function toSpherical(eye) {
+      const rTot = Math.hypot(eye.x, eye.y, eye.z);
+      const theta = Math.atan2(eye.y, eye.x);
+      const phi = Math.atan2(eye.z, Math.hypot(eye.x, eye.y));
+      return { rTot, theta, phi };
+    }
+    pulsarMap.addEventListener('mousedown', e => {
+      stopRotation(); isDragging = true;
+      startX = e.clientX; startY = e.clientY;
+      const sph = toSpherical(camera.eye);
+      totalRadius = sph.rTot; startTheta = sph.theta; startPhi = sph.phi;
+    });
+    window.addEventListener('mousemove', e => {
+      if (!isDragging) return;
+      const dx = e.clientX - startX; const dy = e.clientY - startY;
+      const rotSpeed = 0.005, tiltSpeed = 0.005;
+      let newTheta = startTheta + dx * rotSpeed;
+      let newPhi = startPhi - dy * tiltSpeed;
+      const maxPhi = Math.PI/2 - 0.1, minPhi = -maxPhi;
+      newPhi = Math.max(minPhi, Math.min(maxPhi, newPhi));
+      const cosPhi = Math.cos(newPhi);
+      const newEye = { x: totalRadius * cosPhi * Math.cos(newTheta), y: totalRadius * cosPhi * Math.sin(newTheta), z: totalRadius * Math.sin(newPhi) };
+      camera.eye = newEye;
+      Plotly.relayout(pulsarMap, { 'scene.camera.eye': newEye, 'scene.camera.up': { x:0, y:0, z:1 } });
+    });
+    window.addEventListener('mouseup', () => { if (isDragging) { isDragging = false; startRotation(); } });
+
+    // Auto-rotate
+    let rotationInterval;
+    function startRotation() {
+      rotationInterval = setInterval(() => {
+        const sph = toSpherical(camera.eye); sph.theta += 0.0087;
+        const cosPhi = Math.cos(sph.phi);
+        const newEye = { x: sph.rTot * cosPhi * Math.cos(sph.theta), y: sph.rTot * cosPhi * Math.sin(sph.theta), z: sph.rTot * Math.sin(sph.phi) };
+        camera.eye = newEye;
+        Plotly.relayout(pulsarMap, { 'scene.camera.eye': newEye, 'scene.camera.up': { x:0, y:0, z:1 } });
+      }, 50);
+    }
+    function stopRotation() { clearInterval(rotationInterval); }
+    startRotation();
+
+    // ---------- UI toggles ----------
+    let outliersVisible = false;
+    document.getElementById('toggleOutliers').addEventListener('click', function() {
+      outliersVisible = !outliersVisible;
+      Plotly.restyle(pulsarMap, { visible: outliersVisible }, [outliersTraceIndex]);
+      this.textContent = outliersVisible ? 'Hide Outliers' : 'Show Outliers';
+    });
+
+    const parkesIndex = data.indexOf(parkesTrace);
+    const areciboIndex = data.indexOf(areciboTrace);
+    document.getElementById('toggleParkes').addEventListener('change', function() {
+      Plotly.restyle(pulsarMap, { visible: this.checked }, [parkesIndex]);
+    });
+    document.getElementById('toggleArecibo').addEventListener('change', function() {
+      Plotly.restyle(pulsarMap, { visible: this.checked }, [areciboIndex]);
+    });
+  </script>
+</body>
+</html>
